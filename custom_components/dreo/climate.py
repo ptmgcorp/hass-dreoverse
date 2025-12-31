@@ -11,6 +11,7 @@ from homeassistant.components.climate import (
     ClimateEntity,
     ClimateEntityFeature,
     HVACMode,
+    HVACAction, # ptmgcorp - Import HVACAction
 )
 from homeassistant.const import ATTR_TEMPERATURE, Platform, UnitOfTemperature
 from homeassistant.core import HomeAssistant, callback
@@ -374,6 +375,26 @@ class DreoHeaterClimate(DreoEntity, ClimateEntity):
     _attr_current_temperature: float | None = None
     _attr_target_temperature: float | None = None
     _attr_hvac_mode_relate_map: dict[str, Any] | None = None
+    _last_preset_mode: str | None = None # ptmgcorp - preset
+    _attr_hvac_action: HVACAction | None = None # ptmgcorp - Added attribustes for hvac_action:
+    _temp_tolerance: float = 0.5  # default; will adjust by unit in init # ptmgcorp - Added
+
+    @property
+    def is_on(self) -> bool:
+        """Return if entity is on."""
+        return self._attr_hvac_mode != HVACMode.OFF
+
+    # @property
+    # def extra_state_attributes(self) -> dict[str, Any]:
+    #     base = dict(super().extra_state_attributes or {})
+    #     action = self._attr_hvac_action
+    #     base["heating_state"] = (
+    #     "heating" if action == HVACAction.HEATING
+    #     else "fan" if action == HVACAction.FAN
+    #     else "off" if action == HVACAction.OFF
+    #     else "idle"
+    #     )
+    #     return base
 
     def __init__(
         self, device: dict[str, Any], coordinator: DreoDataUpdateCoordinator
@@ -390,14 +411,28 @@ class DreoHeaterClimate(DreoEntity, ClimateEntity):
         )
 
         self._attr_preset_modes = heater_config.get(DreoFeatureSpec.PRESET_MODES, [])
+        if isinstance(coordinator.data, DreoHeaterDeviceData): # ptmgcorp - 
+            ...
+            # Seed current/last preset from device data (if available)
+            self._attr_preset_mode = coordinator.data.mode
+            self._last_preset_mode = self._attr_preset_mode
+        else:
+            self._attr_preset_mode = None
+            self._last_preset_mode = None
 
         temp_unit = heater_config.get("temperature_unit")
         if temp_unit == "celsius":
             self._attr_temperature_unit = UnitOfTemperature.CELSIUS
+            # ptmgcorp - Initialize tolerance by unit
+            self._temp_tolerance = 0.5
         elif temp_unit == "fahrenheit":
             self._attr_temperature_unit = UnitOfTemperature.FAHRENHEIT
+            # ptmgcorp - Initialize tolerance by unit
+            self._temp_tolerance = 1.0
         else:
             self._attr_temperature_unit = coordinator.hass.config.units.temperature_unit
+        # ptmgcorp - # Pick based on system unit
+        self._temp_tolerance = 0.5 if self._attr_temperature_unit == UnitOfTemperature.CELSIUS else 1.0
 
         temp_range = heater_config.get(DreoFeatureSpec.TEMPERATURE_RANGE, [])
         if isinstance(temp_range, (list, tuple)) and len(temp_range) >= 2:
@@ -423,13 +458,19 @@ class DreoHeaterClimate(DreoEntity, ClimateEntity):
 
         self._attr_available = data.available
 
+        # Base features
         self._attr_supported_features = (
             ClimateEntityFeature.TURN_ON | ClimateEntityFeature.TURN_OFF
         )
+        # ptmgcorp - # Always advertise presets if available
+        if self._attr_preset_modes:
+            self._attr_supported_features |= ClimateEntityFeature.PRESET_MODE
 
         if not data.is_on:
             self._attr_hvac_mode = HVACMode.OFF
-            self._attr_preset_mode = None
+            # ptmgcorp - # Keep showing the last selected preset while OFF
+            if self._last_preset_mode in (self._attr_preset_modes or []):
+                self._attr_preset_mode = self._last_preset_mode
         else:
             mode_config = (
                 self._attr_hvac_mode_relate_map.get(data.hvac_mode, {})
@@ -437,9 +478,7 @@ class DreoHeaterClimate(DreoEntity, ClimateEntity):
                 else {}
             )
 
-            if supported_features := mode_config.get(
-                DreoFeatureSpec.SUPPORTED_FEATURES, []
-            ):
+            if supported_features := mode_config.get(DreoFeatureSpec.SUPPORTED_FEATURES, []):
                 for feature in supported_features:
                     self._attr_supported_features |= feature
 
@@ -457,20 +496,51 @@ class DreoHeaterClimate(DreoEntity, ClimateEntity):
                 if data.hvac_mode:
                     self._attr_hvac_mode = HVACMode(data.hvac_mode)
 
-            if self._attr_hvac_mode in [HVACMode.HEAT]:
-                self._attr_supported_features |= ClimateEntityFeature.PRESET_MODE
+            # ptmgcorp - # Cache the last seen preset when the device is on
+            if self._attr_preset_mode:
+                self._last_preset_mode = self._attr_preset_mode
 
         self._attr_current_temperature = (
             data.current_temperature
             if data.current_temperature is not None
             else self._attr_current_temperature
         )
-
         if data.target_temperature is not None:
             self._attr_target_temperature = data.target_temperature
 
+        # Compute hvac_action
+        self._update_hvac_action()
+
         super()._handle_coordinator_update()
         self.async_write_ha_state()
+        
+    # ptmgcorp - defined helper to update hvac_action depending on state
+    def _update_hvac_action(self) -> None:
+        """Derive current HVAC action (heating/idle/off/fan) from state."""
+        mode = self._attr_hvac_mode
+        # ptmgcorp - # Off -> OFF
+        if mode == HVACMode.OFF:
+            self._attr_hvac_action = HVACAction.OFF
+            return
+
+        # ptmgcorp - # Fan-only mode -> FAN
+        if mode == HVACMode.FAN_ONLY:
+            self._attr_hvac_action = HVACAction.FAN
+            return
+
+        # ptmgcorp - # For heating mode, determine heating vs idle via temperatures
+        ct = self._attr_current_temperature
+        tt = self._attr_target_temperature
+        if ct is None or tt is None:
+            # ptmgcorp - # Fallback: assume idle if we can't compare
+            self._attr_hvac_action = HVACAction.IDLE
+            return
+
+        # ptmgcorp - # Call for heat if current is below target minus tolerance
+        if ct <= tt - self._temp_tolerance:
+            self._attr_hvac_action = HVACAction.HEATING
+        else:
+            self._attr_hvac_action = HVACAction.IDLE
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         """Set new target hvac mode."""
@@ -499,7 +569,14 @@ class DreoHeaterClimate(DreoEntity, ClimateEntity):
         if not self._attr_preset_modes or preset_mode not in self._attr_preset_modes:
             return
 
-        command_dict = {}
+        # ptmgcorp - # Update cache/UI immediately
+        self._last_preset_mode = preset_mode
+        self._attr_preset_mode = preset_mode
+
+        command_dict: dict[str, Any] = {}
+        if not self.is_on:
+            command_dict[DreoDirective.POWER_SWITCH] = True
+
         preset_mode_controls = []
         if self._attr_hvac_mode_relate_map:
             mode_config = self._attr_hvac_mode_relate_map.get(preset_mode, {})
@@ -510,7 +587,7 @@ class DreoHeaterClimate(DreoEntity, ClimateEntity):
         for control in preset_mode_controls:
             directive_name = control.get(DreoFeatureSpec.DIRECTIVE_NAME)
             directive_value = control.get(DreoFeatureSpec.DIRECTIVE_VALUE)
-            if directive_name and directive_value:
+            if directive_name and directive_value is not None:
                 command_dict[directive_name] = directive_value
 
         if command_dict:
